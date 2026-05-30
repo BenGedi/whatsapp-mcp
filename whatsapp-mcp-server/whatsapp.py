@@ -834,9 +834,11 @@ def leave_group(jid: str) -> Tuple[bool, str]:
 
 def remove_participant(group_jid: str, participant: str) -> Tuple[bool, str]:
     try:
-        if not group_jid or not group_jid.strip():
+        group_jid = group_jid.strip()
+        participant = participant.strip()
+        if not group_jid:
             return False, "group_jid is required"
-        if not participant or not participant.strip():
+        if not participant:
             return False, "participant is required"
         url = f"{WHATSAPP_API_BASE_URL}/remove_participant"
         response = requests.post(url, json={"group_jid": group_jid, "participant": participant})
