@@ -357,8 +357,12 @@ def list_chats(
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
             
-        # Add sorting
-        order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
+        # Add sorting — closed allowlist prevents ORDER BY injection
+        _sort_fields = {
+            "last_active": "chats.last_message_time DESC",
+            "name": "chats.name",
+        }
+        order_by = _sort_fields.get(sort_by, "chats.last_message_time DESC")
         query_parts.append(f"ORDER BY {order_by}")
         
         # Add pagination
