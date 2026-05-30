@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
 // noopLog satisfies waLog.Logger without producing output.
@@ -419,5 +423,94 @@ func TestServerDownloadEndpointResponds(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405 Method Not Allowed, got %d", resp.StatusCode)
+	}
+}
+
+// --------------------------------------------------------------------------
+// extractTextContent
+// --------------------------------------------------------------------------
+
+func TestExtractTextContentConversation(t *testing.T) {
+	msg := &waProto.Message{Conversation: proto.String("hello")}
+	if got := extractTextContent(msg); got != "hello" {
+		t.Errorf("expected %q, got %q", "hello", got)
+	}
+}
+
+func TestExtractTextContentExtended(t *testing.T) {
+	msg := &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{Text: proto.String("ext")}}
+	if got := extractTextContent(msg); got != "ext" {
+		t.Errorf("expected %q, got %q", "ext", got)
+	}
+}
+
+func TestExtractTextContentImageCaption(t *testing.T) {
+	msg := &waProto.Message{ImageMessage: &waProto.ImageMessage{Caption: proto.String("pic caption")}}
+	if got := extractTextContent(msg); got != "pic caption" {
+		t.Errorf("expected %q, got %q", "pic caption", got)
+	}
+}
+
+func TestExtractTextContentVideoCaption(t *testing.T) {
+	msg := &waProto.Message{VideoMessage: &waProto.VideoMessage{Caption: proto.String("vid caption")}}
+	if got := extractTextContent(msg); got != "vid caption" {
+		t.Errorf("expected %q, got %q", "vid caption", got)
+	}
+}
+
+func TestExtractTextContentNil(t *testing.T) {
+	if got := extractTextContent(nil); got != "" {
+		t.Errorf("expected empty string for nil, got %q", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// SendMessageRequest JSON — quoted_id field round-trip
+// --------------------------------------------------------------------------
+
+func TestSendMessageRequestQuotedIDJSON(t *testing.T) {
+	// Verify the quoted_id field is correctly omitted when empty and included when set.
+	reqWithQuote := SendMessageRequest{Recipient: "123", Message: "hi", QuotedID: "msg-abc"}
+	b, err := json.Marshal(reqWithQuote)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(b, []byte(`"quoted_id"`)) {
+		t.Errorf("expected quoted_id in JSON when set, got %s", b)
+	}
+
+	reqNoQuote := SendMessageRequest{Recipient: "123", Message: "hi"}
+	b2, err := json.Marshal(reqNoQuote)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(b2, []byte(`"quoted_id"`)) {
+		t.Errorf("expected quoted_id omitted from JSON when empty, got %s", b2)
+	}
+}
+
+// --------------------------------------------------------------------------
+// /api/send handler — quoted_id forwarded in request body
+// --------------------------------------------------------------------------
+
+func TestSendHandlerAcceptsQuotedID(t *testing.T) {
+	srv := httptest.NewServer(buildRouter(nil, nil))
+	defer srv.Close()
+
+	// POST a well-formed request including quoted_id.
+	// The handler will fail (no live client), but it must reach the client
+	// check (StatusInternalServerError), not reject the request as malformed (400).
+	body, _ := json.Marshal(map[string]string{
+		"recipient": "123456789",
+		"message":   "hello",
+		"quoted_id": "some-msg-id",
+	})
+	resp, err := http.Post(srv.URL+"/api/send", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /api/send: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusBadRequest {
+		t.Errorf("quoted_id in body should not cause 400 Bad Request, got %d", resp.StatusCode)
 	}
 }

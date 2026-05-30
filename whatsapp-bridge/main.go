@@ -199,15 +199,33 @@ func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
 		return ""
 	}
-
-	// Try to get text content
 	if text := msg.GetConversation(); text != "" {
 		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
 	}
-
-	// For now, we're ignoring non-text messages
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		return ext.GetText()
+	}
+	if img := msg.GetImageMessage(); img != nil && img.GetCaption() != "" {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil && vid.GetCaption() != "" {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil && doc.GetCaption() != "" {
+		return doc.GetCaption()
+	}
+	if btns := msg.GetButtonsMessage(); btns != nil && btns.GetContentText() != "" {
+		return btns.GetContentText()
+	}
+	if btnResp := msg.GetButtonsResponseMessage(); btnResp != nil && btnResp.GetSelectedDisplayText() != "" {
+		return btnResp.GetSelectedDisplayText()
+	}
+	if list := msg.GetListMessage(); list != nil && list.GetDescription() != "" {
+		return list.GetDescription()
+	}
+	if listResp := msg.GetListResponseMessage(); listResp != nil && listResp.GetTitle() != "" {
+		return listResp.GetTitle()
+	}
 	return ""
 }
 
@@ -222,6 +240,7 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	QuotedID  string `json:"quoted_id,omitempty"`
 }
 
 // validateMediaPath rejects relative paths and paths outside the user's home
@@ -264,7 +283,7 @@ func validateMediaPath(mediaPath string) error {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedID string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -454,6 +473,35 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
 			}
+		}
+	} else if quotedID != "" && messageStore != nil {
+		// Build a quoted (swipe-reply) ExtendedTextMessage.
+		// Look up the quoted message in the local DB to populate ContextInfo.
+		chatJIDStr := recipientJID.String()
+		var quotedContent, quotedSender string
+		_ = messageStore.db.QueryRow(
+			"SELECT COALESCE(content, ''), COALESCE(sender, '') FROM messages WHERE id = ? AND chat_jid = ?",
+			quotedID, chatJIDStr,
+		).Scan(&quotedContent, &quotedSender)
+
+		participantJID := quotedSender
+		if quotedSender != "" && !strings.Contains(quotedSender, "@") {
+			participantJID = quotedSender + "@" + types.DefaultUserServer
+		}
+
+		contextInfo := &waProto.ContextInfo{
+			StanzaID:    proto.String(quotedID),
+			Participant: proto.String(participantJID),
+		}
+		if quotedContent != "" {
+			contextInfo.QuotedMessage = &waProto.Message{
+				Conversation: proto.String(quotedContent),
+			}
+		}
+
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+			Text:        proto.String(message),
+			ContextInfo: contextInfo,
 		}
 	} else {
 		msg.Conversation = proto.String(message)
@@ -989,7 +1037,7 @@ func buildRouter(client *whatsmeow.Client, messageStore *MessageStore) *http.Ser
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, req.QuotedID)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
