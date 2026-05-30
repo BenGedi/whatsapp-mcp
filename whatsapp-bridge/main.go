@@ -479,10 +479,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Look up the quoted message in the local DB to populate ContextInfo.
 		chatJIDStr := recipientJID.String()
 		var quotedContent, quotedSender string
-		_ = messageStore.db.QueryRow(
+		err := messageStore.db.QueryRow(
 			"SELECT COALESCE(content, ''), COALESCE(sender, '') FROM messages WHERE id = ? AND chat_jid = ?",
 			quotedID, chatJIDStr,
 		).Scan(&quotedContent, &quotedSender)
+		if err != nil {
+			return false, fmt.Sprintf("quoted_id %q not found in local message store", quotedID)
+		}
 
 		participantJID := quotedSender
 		if quotedSender != "" && !strings.Contains(quotedSender, "@") {
