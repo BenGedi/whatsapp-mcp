@@ -204,6 +204,8 @@ type SendMessageRequest struct {
 
 // validateMediaPath rejects relative paths and paths outside the user's home
 // directory, preventing path traversal and system-file exfiltration via /api/send.
+// Symlinks are resolved before the containment check to prevent escapes via
+// in-home symlinks pointing outside the home directory.
 func validateMediaPath(mediaPath string) error {
 	if mediaPath == "" {
 		return fmt.Errorf("media path cannot be empty")
@@ -213,12 +215,23 @@ func validateMediaPath(mediaPath string) error {
 	}
 	cleaned := filepath.Clean(mediaPath)
 	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		if !strings.HasPrefix(cleaned, homeDir+string(filepath.Separator)) {
-			return fmt.Errorf("media path must be within the user home directory")
-		}
+	if err != nil {
+		return fmt.Errorf("failed to determine user home directory: %v", err)
 	}
-	info, err := os.Stat(cleaned)
+	resolvedHome, err := filepath.EvalSymlinks(homeDir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve user home directory: %v", err)
+	}
+	// EvalSymlinks also verifies the path exists, so this doubles as existence check.
+	resolvedPath, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		return fmt.Errorf("media file not found: %v", err)
+	}
+	rel, err := filepath.Rel(resolvedHome, resolvedPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("media path must be within the user home directory")
+	}
+	info, err := os.Stat(resolvedPath)
 	if err != nil {
 		return fmt.Errorf("media file not found: %v", err)
 	}

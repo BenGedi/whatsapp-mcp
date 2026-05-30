@@ -65,6 +65,18 @@ func TestValidateMediaPath(t *testing.T) {
 			errContains: "media file not found",
 		},
 		{
+			name:        "symlink inside home pointing outside is rejected",
+			path:        func() string {
+				// Create a symlink inside home that points to /etc/passwd
+				link := filepath.Join(homeDir, "test-evil-symlink")
+				os.Remove(link)
+				_ = os.Symlink("/etc/passwd", link)
+				return link
+			}(),
+			wantError:   true,
+			errContains: "media path must be within the user home directory",
+		},
+		{
 			name:        "directory instead of file",
 			path:        tmpDir,
 			wantError:   true,
