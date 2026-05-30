@@ -1,0 +1,335 @@
+package main
+
+import (
+	"database/sql"
+	"testing"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+	"go.mau.fi/whatsmeow/types"
+	waLog "go.mau.fi/whatsmeow/util/log"
+)
+
+// noopLog satisfies waLog.Logger without producing output.
+type noopLog struct{}
+
+func (noopLog) Debugf(string, ...interface{}) {}
+func (noopLog) Infof(string, ...interface{})  {}
+func (noopLog) Warnf(string, ...interface{})  {}
+func (noopLog) Errorf(string, ...interface{}) {}
+func (noopLog) Sub(string) waLog.Logger       { return noopLog{} }
+
+// newTestStore opens a fresh in-memory SQLite MessageStore with the production schema.
+func newTestStore(t *testing.T) *MessageStore {
+	t.Helper()
+	db, err := sql.Open("sqlite3", "file::memory:?_foreign_keys=on")
+	if err != nil {
+		t.Fatalf("open in-memory db: %v", err)
+	}
+	// Restrict to one connection so the in-memory DB isn't lost when the pool opens a second.
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS chats (
+			jid TEXT PRIMARY KEY,
+			name TEXT,
+			last_message_time TIMESTAMP
+		);
+		CREATE TABLE IF NOT EXISTS messages (
+			id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			content TEXT,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			media_type TEXT,
+			filename TEXT,
+			url TEXT,
+			media_key BLOB,
+			file_sha256 BLOB,
+			file_enc_sha256 BLOB,
+			file_length INTEGER,
+			PRIMARY KEY (id, chat_jid),
+			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+	`)
+	if err != nil {
+		db.Close()
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return &MessageStore{db: db}
+}
+
+func storeMsg(t *testing.T, store *MessageStore, id, chatJID, content string, ts time.Time) {
+	t.Helper()
+	if err := store.StoreMessage(id, chatJID, "sender", content, ts, false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatalf("StoreMessage(%s): %v", id, err)
+	}
+}
+
+func chatCount(t *testing.T, store *MessageStore, jid string) int {
+	t.Helper()
+	var n int
+	store.db.QueryRow("SELECT COUNT(*) FROM chats WHERE jid = ?", jid).Scan(&n)
+	return n
+}
+
+func msgCount(t *testing.T, store *MessageStore, chatJID string) int {
+	t.Helper()
+	var n int
+	store.db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_jid = ?", chatJID).Scan(&n)
+	return n
+}
+
+// pnResolver returns a resolver that maps a specific @lid user to a fixed PN JID.
+func pnResolver(lidUser, pnUser string) func(types.JID) types.JID {
+	return func(jid types.JID) types.JID {
+		if jid.Server == types.HiddenUserServer && jid.User == lidUser {
+			return types.JID{User: pnUser, Server: types.DefaultUserServer}
+		}
+		return jid
+	}
+}
+
+// identityResolver returns every JID unchanged (simulates "no PN mapping known").
+func identityResolver(jid types.JID) types.JID { return jid }
+
+// --------------------------------------------------------------------------
+// resolveToPN
+// --------------------------------------------------------------------------
+
+func TestResolveToPNNilClient(t *testing.T) {
+	jid := types.JID{User: "123", Server: types.HiddenUserServer}
+	got := resolveToPN(nil, jid)
+	if got != jid {
+		t.Errorf("expected %v unchanged, got %v", jid, got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// EnsureChat
+// --------------------------------------------------------------------------
+
+func TestEnsureChatCreatesRow(t *testing.T) {
+	store := newTestStore(t)
+	ts := time.Now().Truncate(time.Second)
+	jid := "111@s.whatsapp.net"
+
+	if err := store.EnsureChat(jid, ts); err != nil {
+		t.Fatalf("EnsureChat: %v", err)
+	}
+	if chatCount(t, store, jid) != 1 {
+		t.Errorf("expected row to be created")
+	}
+	var name string
+	store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid).Scan(&name)
+	if name != "" {
+		t.Errorf("expected empty name on new row, got %q", name)
+	}
+}
+
+func TestEnsureChatDoesNotOverwriteExisting(t *testing.T) {
+	store := newTestStore(t)
+	ts := time.Now().Truncate(time.Second)
+	jid := "222@s.whatsapp.net"
+
+	store.StoreChat(jid, "Alice", ts)
+	// EnsureChat must leave the resolved name untouched.
+	if err := store.EnsureChat(jid, ts.Add(time.Hour)); err != nil {
+		t.Fatalf("EnsureChat: %v", err)
+	}
+	var name string
+	store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid).Scan(&name)
+	if name != "Alice" {
+		t.Errorf("expected name %q preserved, got %q", "Alice", name)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TouchChatLastMessageTime
+// --------------------------------------------------------------------------
+
+func TestTouchChatLastMessageTimeUpdatesOnlyTimestamp(t *testing.T) {
+	store := newTestStore(t)
+	ts := time.Now().Truncate(time.Second).UTC()
+	jid := "333@s.whatsapp.net"
+
+	store.StoreChat(jid, "Bob", ts)
+	later := ts.Add(time.Hour)
+	if err := store.TouchChatLastMessageTime(jid, later); err != nil {
+		t.Fatalf("TouchChatLastMessageTime: %v", err)
+	}
+
+	var name string
+	var got time.Time
+	store.db.QueryRow("SELECT name, last_message_time FROM chats WHERE jid = ?", jid).Scan(&name, &got)
+	if name != "Bob" {
+		t.Errorf("name changed unexpectedly: got %q", name)
+	}
+	if got.UTC().Unix() != later.Unix() {
+		t.Errorf("expected timestamp %v, got %v", later, got.UTC())
+	}
+}
+
+// --------------------------------------------------------------------------
+// migrateLIDChatsWithResolver
+// --------------------------------------------------------------------------
+
+func TestMigrateLIDChatsNilStore(t *testing.T) {
+	// Must not panic.
+	migrateLIDChatsWithResolver(nil, noopLog{}, identityResolver)
+	migrateLIDChatsWithResolver(&MessageStore{}, noopLog{}, identityResolver)
+}
+
+func TestMigrateLIDChatsNoLIDChats(t *testing.T) {
+	store := newTestStore(t)
+	ts := time.Now().Truncate(time.Second)
+
+	store.StoreChat("444@s.whatsapp.net", "Carol", ts)
+
+	migrateLIDChatsWithResolver(store, noopLog{}, identityResolver)
+
+	if chatCount(t, store, "444@s.whatsapp.net") != 1 {
+		t.Errorf("PN chat should be untouched")
+	}
+}
+
+func TestMigrateLIDChatsSkippedWhenNoMapping(t *testing.T) {
+	store := newTestStore(t)
+	ts := time.Now().Truncate(time.Second)
+	lidStr := "abc@" + types.HiddenUserServer
+
+	store.StoreChat(lidStr, "Unknown", ts)
+	storeMsg(t, store, "m1", lidStr, "hello", ts)
+
+	// identity resolver → no PN mapping → all skipped
+	migrateLIDChatsWithResolver(store, noopLog{}, identityResolver)
+
+	if chatCount(t, store, lidStr) != 1 {
+		t.Errorf("@lid chat should remain when no PN mapping is known")
+	}
+	if msgCount(t, store, lidStr) != 1 {
+		t.Errorf("@lid messages should remain when no PN mapping is known")
+	}
+}
+
+func TestMigrateLIDChatsMergeIntoNewPN(t *testing.T) {
+	store := newTestStore(t)
+	ts := time.Now().Truncate(time.Second)
+	lidStr := "abc@" + types.HiddenUserServer
+	pnStr := "123@" + types.DefaultUserServer
+
+	store.StoreChat(lidStr, "Alice", ts)
+	storeMsg(t, store, "m1", lidStr, "hello", ts)
+	storeMsg(t, store, "m2", lidStr, "world", ts.Add(time.Second))
+
+	migrateLIDChatsWithResolver(store, noopLog{}, pnResolver("abc", "123"))
+
+	if chatCount(t, store, lidStr) != 0 {
+		t.Errorf("@lid chat should be deleted after merge")
+	}
+	if msgCount(t, store, lidStr) != 0 {
+		t.Errorf("@lid messages should be deleted after merge")
+	}
+	if chatCount(t, store, pnStr) != 1 {
+		t.Errorf("PN chat should be created")
+	}
+	if msgCount(t, store, pnStr) != 2 {
+		t.Errorf("both messages should be under PN chat, got %d", msgCount(t, store, pnStr))
+	}
+}
+
+func TestMigrateLIDChatsMergeIntoExistingPN(t *testing.T) {
+	store := newTestStore(t)
+	ts := time.Now().Truncate(time.Second)
+	lidStr := "abc@" + types.HiddenUserServer
+	pnStr := "123@" + types.DefaultUserServer
+
+	// Pre-existing PN chat with a resolved name and a later timestamp.
+	store.StoreChat(pnStr, "Alice Smith", ts.Add(2*time.Second))
+	storeMsg(t, store, "pn-m1", pnStr, "existing msg", ts.Add(2*time.Second))
+
+	// @lid chat with an earlier timestamp and an unresolved name.
+	store.StoreChat(lidStr, "", ts)
+	storeMsg(t, store, "lid-m1", lidStr, "lid msg", ts)
+
+	migrateLIDChatsWithResolver(store, noopLog{}, pnResolver("abc", "123"))
+
+	if chatCount(t, store, lidStr) != 0 {
+		t.Errorf("@lid chat should be deleted")
+	}
+	// PN chat must retain its resolved name and the later timestamp.
+	var name string
+	store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", pnStr).Scan(&name)
+	if name != "Alice Smith" {
+		t.Errorf("PN chat name should be preserved, got %q", name)
+	}
+	if msgCount(t, store, pnStr) != 2 {
+		t.Errorf("expected 2 messages under PN chat, got %d", msgCount(t, store, pnStr))
+	}
+}
+
+func TestMigrateLIDChatsDedupOnPKConflict(t *testing.T) {
+	store := newTestStore(t)
+	ts := time.Now().Truncate(time.Second)
+	lidStr := "abc@" + types.HiddenUserServer
+	pnStr := "123@" + types.DefaultUserServer
+
+	// PN chat already has "shared-id".
+	store.StoreChat(pnStr, "Alice", ts)
+	storeMsg(t, store, "shared-id", pnStr, "original content", ts)
+
+	// @lid chat has the same message ID — this is the duplicate.
+	store.StoreChat(lidStr, "", ts)
+	storeMsg(t, store, "shared-id", lidStr, "duplicate content", ts)
+	storeMsg(t, store, "unique-id", lidStr, "unique msg", ts.Add(time.Second))
+
+	migrateLIDChatsWithResolver(store, noopLog{}, pnResolver("abc", "123"))
+
+	if chatCount(t, store, lidStr) != 0 {
+		t.Errorf("@lid chat should be deleted")
+	}
+	// Exactly 2 messages: original "shared-id" + moved "unique-id". Duplicate dropped.
+	if msgCount(t, store, pnStr) != 2 {
+		t.Errorf("expected 2 messages (deduped), got %d", msgCount(t, store, pnStr))
+	}
+	// The PN-side "shared-id" content must be preserved (UPDATE OR IGNORE keeps it).
+	var content string
+	store.db.QueryRow("SELECT content FROM messages WHERE id = ? AND chat_jid = ?", "shared-id", pnStr).Scan(&content)
+	if content != "original content" {
+		t.Errorf("original message should win on PK conflict, got %q", content)
+	}
+}
+
+func TestMigrateLIDChatsIdempotent(t *testing.T) {
+	store := newTestStore(t)
+	ts := time.Now().Truncate(time.Second)
+	lidStr := "abc@" + types.HiddenUserServer
+
+	store.StoreChat(lidStr, "Dave", ts)
+	storeMsg(t, store, "m1", lidStr, "hello", ts)
+
+	resolver := pnResolver("abc", "999")
+
+	migrateLIDChatsWithResolver(store, noopLog{}, resolver)
+
+	var countBefore int
+	store.db.QueryRow("SELECT COUNT(*) FROM chats").Scan(&countBefore)
+	var msgBefore int
+	store.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&msgBefore)
+
+	// Second run must be a no-op.
+	migrateLIDChatsWithResolver(store, noopLog{}, resolver)
+
+	var countAfter int
+	store.db.QueryRow("SELECT COUNT(*) FROM chats").Scan(&countAfter)
+	var msgAfter int
+	store.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&msgAfter)
+
+	if countBefore != countAfter {
+		t.Errorf("second run changed chat count: %d -> %d", countBefore, countAfter)
+	}
+	if msgBefore != msgAfter {
+		t.Errorf("second run changed message count: %d -> %d", msgBefore, msgAfter)
+	}
+}
