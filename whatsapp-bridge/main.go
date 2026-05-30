@@ -202,6 +202,26 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// validateMediaPath rejects relative paths and paths that contain traversal
+// sequences, preventing arbitrary file reads via the /api/send endpoint.
+func validateMediaPath(mediaPath string) error {
+	if mediaPath == "" {
+		return fmt.Errorf("media path cannot be empty")
+	}
+	if !filepath.IsAbs(mediaPath) {
+		return fmt.Errorf("media path must be absolute")
+	}
+	cleaned := filepath.Clean(mediaPath)
+	info, err := os.Stat(cleaned)
+	if err != nil {
+		return fmt.Errorf("media file not found: %v", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("media path must point to a file, not a directory")
+	}
+	return nil
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -233,8 +253,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		if err := validateMediaPath(mediaPath); err != nil {
+			return false, fmt.Sprintf("Invalid media path: %v", err)
+		}
 		// Read media file
-		mediaData, err := os.ReadFile(mediaPath)
+		mediaData, err := os.ReadFile(filepath.Clean(mediaPath))
 		if err != nil {
 			return false, fmt.Sprintf("Error reading media file: %v", err)
 		}
@@ -397,8 +420,8 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 	// Check for document message
 	if doc := msg.GetDocumentMessage(); doc != nil {
-		filename := doc.GetFileName()
-		if filename == "" {
+		filename := filepath.Base(doc.GetFileName())
+		if filename == "" || filename == "." {
 			filename = "document_" + time.Now().Format("20060102_150405")
 		}
 		return "document", filename,
@@ -553,6 +576,16 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+// sanitizeChatJIDForPath converts a chat JID into a safe directory name by
+// replacing colons and rejecting any path-traversal characters.
+func sanitizeChatJIDForPath(chatJID string) (string, error) {
+	safe := strings.ReplaceAll(chatJID, ":", "_")
+	if strings.Contains(safe, "..") || strings.ContainsAny(safe, "/\\") {
+		return "", fmt.Errorf("invalid chat JID: %q", chatJID)
+	}
+	return safe, nil
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message
@@ -562,7 +595,11 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	safeJID, err := sanitizeChatJIDForPath(chatJID)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("invalid chat JID: %v", err)
+	}
+	chatDir := fmt.Sprintf("store/%s", safeJID)
 	localPath := ""
 
 	// Get media info from the database
@@ -774,8 +811,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server — bind to loopback only so the unauthenticated API
+	// is not reachable from other hosts on the LAN.
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
