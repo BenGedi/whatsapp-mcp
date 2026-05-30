@@ -2,6 +2,8 @@ package main
 
 import (
 	"database/sql"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -70,14 +72,18 @@ func storeMsg(t *testing.T, store *MessageStore, id, chatJID, content string, ts
 func chatCount(t *testing.T, store *MessageStore, jid string) int {
 	t.Helper()
 	var n int
-	store.db.QueryRow("SELECT COUNT(*) FROM chats WHERE jid = ?", jid).Scan(&n)
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM chats WHERE jid = ?", jid).Scan(&n); err != nil {
+		t.Fatalf("count chats for %s: %v", jid, err)
+	}
 	return n
 }
 
 func msgCount(t *testing.T, store *MessageStore, chatJID string) int {
 	t.Helper()
 	var n int
-	store.db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_jid = ?", chatJID).Scan(&n)
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_jid = ?", chatJID).Scan(&n); err != nil {
+		t.Fatalf("count messages for %s: %v", chatJID, err)
+	}
 	return n
 }
 
@@ -331,5 +337,87 @@ func TestMigrateLIDChatsIdempotent(t *testing.T) {
 	}
 	if msgBefore != msgAfter {
 		t.Errorf("second run changed message count: %d -> %d", msgBefore, msgAfter)
+	}
+}
+
+// --------------------------------------------------------------------------
+// resolveBridgePort
+// --------------------------------------------------------------------------
+
+func TestResolveBridgePortDefault(t *testing.T) {
+	if got := resolveBridgePort("", noopLog{}); got != 8080 {
+		t.Errorf("empty env: expected 8080, got %d", got)
+	}
+}
+
+func TestResolveBridgePortValid(t *testing.T) {
+	if got := resolveBridgePort("18082", noopLog{}); got != 18082 {
+		t.Errorf("expected 18082, got %d", got)
+	}
+}
+
+func TestResolveBridgePortInvalidString(t *testing.T) {
+	if got := resolveBridgePort("abc", noopLog{}); got != 8080 {
+		t.Errorf("non-numeric: expected fallback 8080, got %d", got)
+	}
+}
+
+func TestResolveBridgePortZero(t *testing.T) {
+	if got := resolveBridgePort("0", noopLog{}); got != 8080 {
+		t.Errorf("zero: expected fallback 8080, got %d", got)
+	}
+}
+
+func TestResolveBridgePortOutOfRange(t *testing.T) {
+	if got := resolveBridgePort("99999", noopLog{}); got != 8080 {
+		t.Errorf("out-of-range: expected fallback 8080, got %d", got)
+	}
+}
+
+func TestResolveBridgePortBoundaries(t *testing.T) {
+	if got := resolveBridgePort("1", noopLog{}); got != 1 {
+		t.Errorf("min valid port: expected 1, got %d", got)
+	}
+	if got := resolveBridgePort("65535", noopLog{}); got != 65535 {
+		t.Errorf("max valid port: expected 65535, got %d", got)
+	}
+	if got := resolveBridgePort("65536", noopLog{}); got != 8080 {
+		t.Errorf("one above max: expected fallback 8080, got %d", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// buildRouter / REST server connectivity (test plan item 2)
+// --------------------------------------------------------------------------
+
+// TestServerBindsAndAcceptsTraffic starts a real HTTP server via httptest
+// and verifies it responds to requests. A GET to /api/send returns 405
+// (method check fires before any client/store access), so nil client/store
+// are safe here.
+func TestServerBindsAndAcceptsTraffic(t *testing.T) {
+	srv := httptest.NewServer(buildRouter(nil, nil))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/send")
+	if err != nil {
+		t.Fatalf("GET /api/send: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 Method Not Allowed, got %d", resp.StatusCode)
+	}
+}
+
+func TestServerDownloadEndpointResponds(t *testing.T) {
+	srv := httptest.NewServer(buildRouter(nil, nil))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/download")
+	if err != nil {
+		t.Fatalf("GET /api/download: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 Method Not Allowed, got %d", resp.StatusCode)
 	}
 }

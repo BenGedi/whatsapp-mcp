@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -943,10 +944,24 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func resolveBridgePort(envVal string, logger waLog.Logger) int {
+	const defaultPort = 8080
+	if envVal == "" {
+		return defaultPort
+	}
+	parsed, err := strconv.Atoi(envVal)
+	if err != nil || parsed <= 0 || parsed >= 65536 {
+		logger.Warnf("Invalid WHATSAPP_BRIDGE_PORT value %q, falling back to %d", envVal, defaultPort)
+		return defaultPort
+	}
+	return parsed
+}
+
+func buildRouter(client *whatsmeow.Client, messageStore *MessageStore) *http.ServeMux {
+	mux := http.NewServeMux()
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -992,7 +1007,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1042,14 +1057,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server — bind to loopback only so the unauthenticated API
-	// is not reachable from other hosts on the LAN.
+	return mux
+}
+
+// Start a REST API server to expose the WhatsApp client functionality.
+// Bind to loopback only so the unauthenticated API is not reachable from the LAN.
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
-
-	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.ListenAndServe(serverAddr, buildRouter(client, messageStore)); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -1176,8 +1193,8 @@ func main() {
 
 	migrateLIDChats(client, messageStore, logger)
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server (port configurable via WHATSAPP_BRIDGE_PORT, default 8080)
+	startRESTServer(client, messageStore, resolveBridgePort(os.Getenv("WHATSAPP_BRIDGE_PORT"), logger))
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
