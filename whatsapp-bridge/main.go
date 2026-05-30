@@ -1152,8 +1152,16 @@ func leaveWhatsAppGroup(client *whatsmeow.Client, jidStr string) LeaveGroupRespo
 	return LeaveGroupResponse{Success: true, Message: fmt.Sprintf("Left group %s", jid.String())}
 }
 
+// groupParticipantClient is the subset of whatsmeow.Client used by removeWhatsAppGroupParticipant.
+// Declared as an interface so tests can inject a mock without a real WhatsApp connection.
+type groupParticipantClient interface {
+	IsConnected() bool
+	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
+	UpdateGroupParticipants(ctx context.Context, jid types.JID, participantChanges []types.JID, action whatsmeow.ParticipantChange) ([]types.GroupParticipant, error)
+}
+
 // removeWhatsAppGroupParticipant removes a participant from a WhatsApp group.
-func removeWhatsAppGroupParticipant(client *whatsmeow.Client, groupJIDStr, participantStr string) RemoveParticipantResponse {
+func removeWhatsAppGroupParticipant(client groupParticipantClient, groupJIDStr, participantStr string) RemoveParticipantResponse {
 	groupJIDStr = strings.TrimSpace(groupJIDStr)
 	participantStr = strings.TrimSpace(participantStr)
 	if groupJIDStr == "" {
