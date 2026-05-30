@@ -8,4 +8,9 @@ dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
     "requests>=2.32.3",
+    # Explicit floor pins for transitive deps with known CVEs:
+    # h11 < 0.16.0 — CVE-2025-43859 HTTP request smuggling (CVSS 9.1)
+    "h11>=0.16.0",
+    # urllib3 < 2.5.0 — multiple CVEs (CVSS 9.1)
+    "urllib3>=2.5.0",
 ]
