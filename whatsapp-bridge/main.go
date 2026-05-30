@@ -107,6 +107,27 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// TouchChatLastMessageTime updates only last_message_time on an existing chat row.
+// Used by sendWhatsAppMessage so outbound sends bump the chats-list ordering without clobbering a resolved name.
+func (store *MessageStore) TouchChatLastMessageTime(jid string, lastMessageTime time.Time) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET last_message_time = ? WHERE jid = ?",
+		lastMessageTime, jid,
+	)
+	return err
+}
+
+// EnsureChat creates a chat row if none exists, leaving any existing row (and its resolved name) untouched.
+// Required before StoreMessage in the outbound path: messages.chat_jid has a FOREIGN KEY into chats.jid,
+// so a brand-new recipient with no prior handleMessage or history-sync entry would otherwise fail silently.
+func (store *MessageStore) EnsureChat(jid string, lastMessageTime time.Time) error {
+	_, err := store.db.Exec(
+		"INSERT OR IGNORE INTO chats (jid, name, last_message_time) VALUES (?, '', ?)",
+		jid, lastMessageTime,
+	)
+	return err
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
@@ -242,7 +263,7 @@ func validateMediaPath(mediaPath string) error {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -438,10 +459,32 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// Persist text outbounds locally so readers can render their own sends.
+	// Multi-device echo via handleMessage doesn't fire on single-device accounts,
+	// so without this the outbound row never reaches the local store.
+	// Media outbounds are skipped: the extractMediaInfo metadata isn't available here.
+	// TODO(media-send): reconstruct media_type, filename, url, media_key,
+	// file_sha256, file_enc_sha256, file_length from resp+msg and persist via StoreMessage.
+	if messageStore != nil && mediaPath == "" && client.Store != nil && client.Store.ID != nil {
+		chatJID := recipientJID.String()
+		sender := client.Store.ID.User
+		if ensureErr := messageStore.EnsureChat(chatJID, resp.Timestamp); ensureErr != nil {
+			fmt.Printf("Failed to ensure chat row: %v\n", ensureErr)
+		}
+		if storeErr := messageStore.StoreMessage(
+			resp.ID, chatJID, sender, message, resp.Timestamp, true,
+			"", "", "", nil, nil, nil, 0,
+		); storeErr != nil {
+			fmt.Printf("Failed to persist outbound: %v\n", storeErr)
+		} else {
+			_ = messageStore.TouchChatLastMessageTime(chatJID, resp.Timestamp)
+		}
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -796,7 +839,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
