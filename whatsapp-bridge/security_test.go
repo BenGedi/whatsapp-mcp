@@ -28,11 +28,21 @@ func TestValidateMediaPath(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// Create a symlink inside home pointing to /etc/passwd for the symlink-escape test.
+	// May fail on Windows (no /etc/passwd, or elevated privileges required).
+	symlinkPath := filepath.Join(homeDir, "test-evil-symlink")
+	os.Remove(symlinkPath)
+	symlinkErr := os.Symlink("/etc/passwd", symlinkPath)
+	if symlinkErr == nil {
+		t.Cleanup(func() { os.Remove(symlinkPath) })
+	}
+
 	tests := []struct {
 		name        string
 		path        string
 		wantError   bool
 		errContains string
+		skip        bool
 	}{
 		{
 			name:        "empty path",
@@ -66,15 +76,10 @@ func TestValidateMediaPath(t *testing.T) {
 		},
 		{
 			name:        "symlink inside home pointing outside is rejected",
-			path:        func() string {
-				// Create a symlink inside home that points to /etc/passwd
-				link := filepath.Join(homeDir, "test-evil-symlink")
-				os.Remove(link)
-				_ = os.Symlink("/etc/passwd", link)
-				return link
-			}(),
+			path:        symlinkPath,
 			wantError:   true,
 			errContains: "media path must be within the user home directory",
+			skip:        symlinkErr != nil,
 		},
 		{
 			name:        "directory instead of file",
@@ -91,6 +96,9 @@ func TestValidateMediaPath(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.skip {
+				t.Skip("skipped: prerequisite setup failed")
+			}
 			err := validateMediaPath(tt.path)
 			if tt.wantError {
 				if err == nil {
