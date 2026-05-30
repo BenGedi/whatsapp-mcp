@@ -267,6 +267,19 @@ type LeaveGroupResponse struct {
 	clientError bool   // true for input-validation failures → HTTP 400
 }
 
+// RemoveParticipantRequest represents the request body for the remove participant API.
+type RemoveParticipantRequest struct {
+	GroupJID    string `json:"group_jid"`
+	Participant string `json:"participant"`
+}
+
+// RemoveParticipantResponse represents the response for the remove participant API.
+type RemoveParticipantResponse struct {
+	Success     bool   `json:"success"`
+	Message     string `json:"message"`
+	clientError bool
+}
+
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
@@ -1139,6 +1152,65 @@ func leaveWhatsAppGroup(client *whatsmeow.Client, jidStr string) LeaveGroupRespo
 	return LeaveGroupResponse{Success: true, Message: fmt.Sprintf("Left group %s", jid.String())}
 }
 
+// groupParticipantClient is the subset of whatsmeow.Client used by removeWhatsAppGroupParticipant.
+// Declared as an interface so tests can inject a mock without a real WhatsApp connection.
+type groupParticipantClient interface {
+	IsConnected() bool
+	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
+	UpdateGroupParticipants(ctx context.Context, jid types.JID, participantChanges []types.JID, action whatsmeow.ParticipantChange) ([]types.GroupParticipant, error)
+}
+
+// removeWhatsAppGroupParticipant removes a participant from a WhatsApp group.
+func removeWhatsAppGroupParticipant(client groupParticipantClient, groupJIDStr, participantStr string) RemoveParticipantResponse {
+	groupJIDStr = strings.TrimSpace(groupJIDStr)
+	participantStr = strings.TrimSpace(participantStr)
+	if groupJIDStr == "" {
+		return RemoveParticipantResponse{Success: false, Message: "group_jid is required", clientError: true}
+	}
+	if participantStr == "" {
+		return RemoveParticipantResponse{Success: false, Message: "participant is required", clientError: true}
+	}
+	groupJID, err := types.ParseJID(groupJIDStr)
+	if err != nil {
+		return RemoveParticipantResponse{Success: false, Message: fmt.Sprintf("Invalid group JID: %v", err), clientError: true}
+	}
+	if groupJID.Server != "g.us" {
+		return RemoveParticipantResponse{Success: false, Message: "group_jid must end in @g.us", clientError: true}
+	}
+	// Normalize the caller-supplied participant to a bare phone number for matching.
+	// Strip @s.whatsapp.net or @lid if present so we can compare against GroupParticipant.PhoneNumber.User.
+	normalized := participantStr
+	if idx := strings.Index(normalized, "@"); idx != -1 {
+		normalized = normalized[:idx]
+	}
+	if !client.IsConnected() {
+		return RemoveParticipantResponse{Success: false, Message: "Not connected to WhatsApp"}
+	}
+	// Fetch group info to get the authoritative participant JIDs.
+	// WhatsApp now uses LID-based JIDs (@lid) as the primary identifier in
+	// groups; passing a phone-number JID directly to UpdateGroupParticipants
+	// causes a silent IQ timeout. We resolve the correct primary JID here.
+	groupInfo, err := client.GetGroupInfo(context.Background(), groupJID)
+	if err != nil {
+		return RemoveParticipantResponse{Success: false, Message: fmt.Sprintf("Could not fetch group info: %v", err)}
+	}
+	var resolvedJID types.JID
+	for _, p := range groupInfo.Participants {
+		if p.PhoneNumber.User == normalized || p.JID.User == normalized || p.LID.User == normalized {
+			resolvedJID = p.JID
+			break
+		}
+	}
+	if resolvedJID.IsEmpty() {
+		return RemoveParticipantResponse{Success: false, Message: fmt.Sprintf("Participant %s not found in group", participantStr), clientError: true}
+	}
+	_, err = client.UpdateGroupParticipants(context.Background(), groupJID, []types.JID{resolvedJID}, whatsmeow.ParticipantChangeRemove)
+	if err != nil {
+		return RemoveParticipantResponse{Success: false, Message: fmt.Sprintf("Error removing participant: %v", err)}
+	}
+	return RemoveParticipantResponse{Success: true, Message: fmt.Sprintf("Removed %s from %s", resolvedJID.String(), groupJID.String())}
+}
+
 func buildRouter(client *whatsmeow.Client, messageStore *MessageStore) *http.ServeMux {
 	mux := http.NewServeMux()
 
@@ -1252,6 +1324,30 @@ func buildRouter(client *whatsmeow.Client, messageStore *MessageStore) *http.Ser
 		}
 		fmt.Printf("Received request to create group %q with %d participants\n", req.Name, len(req.Participants))
 		resp := createWhatsAppGroup(client, messageStore, req)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			if resp.clientError {
+				w.WriteHeader(http.StatusBadRequest)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for removing a participant from a group
+	mux.HandleFunc("/api/remove_participant", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req RemoveParticipantRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to remove participant %s from group %s\n", req.Participant, req.GroupJID)
+		resp := removeWhatsAppGroupParticipant(client, req.GroupJID, req.Participant)
 		w.Header().Set("Content-Type", "application/json")
 		if !resp.Success {
 			if resp.clientError {

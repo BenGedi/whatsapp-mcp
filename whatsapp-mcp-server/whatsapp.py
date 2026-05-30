@@ -830,3 +830,24 @@ def leave_group(jid: str) -> Tuple[bool, str]:
         return False, f"Request error: {str(e)}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+
+
+def remove_participant(group_jid: str, participant: str) -> Tuple[bool, str]:
+    try:
+        group_jid = group_jid.strip()
+        participant = participant.strip()
+        if not group_jid:
+            return False, "group_jid is required"
+        if not participant:
+            return False, "participant is required"
+        url = f"{WHATSAPP_API_BASE_URL}/remove_participant"
+        response = requests.post(url, json={"group_jid": group_jid, "participant": participant})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}"
+        return bool(result.get("success", False)), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"

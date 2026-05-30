@@ -14,7 +14,8 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media,
     create_group as whatsapp_create_group,
-    leave_group as whatsapp_leave_group
+    leave_group as whatsapp_leave_group,
+    remove_participant as whatsapp_remove_participant
 )
 
 # Initialize FastMCP server
@@ -297,6 +298,21 @@ def leave_group(jid: str) -> Dict[str, Any]:
         Dict with success (bool) and message (str).
     """
     success, message = whatsapp_leave_group(jid)
+    return {"success": success, "message": message}
+
+
+@mcp.tool()
+def remove_participant(group_jid: str, participant: str) -> Dict[str, Any]:
+    """Remove a participant from a WhatsApp group. You must be an admin of the group.
+
+    Args:
+        group_jid: The group JID (must end with @g.us, e.g. "120363426272007458@g.us")
+        participant: Phone number or JID of the participant to remove (e.g. "972501234567" or "972501234567@s.whatsapp.net")
+
+    Returns:
+        Dict with success (bool) and message (str).
+    """
+    success, message = whatsapp_remove_participant(group_jid, participant)
     return {"success": success, "message": message}
 
 
