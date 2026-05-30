@@ -593,6 +593,64 @@ func TestLeaveGroupEndpointRejectsBadJSON(t *testing.T) {
 	}
 }
 
+func TestCreateGroupValidationErrors400(t *testing.T) {
+	store := newTestStore(t)
+	srv := httptest.NewServer(buildRouter(nil, store))
+	defer srv.Close()
+
+	cases := []struct {
+		name string
+		body map[string]any
+	}{
+		{"empty name", map[string]any{"name": "", "participants": []string{"123"}}},
+		{"name too long", map[string]any{"name": "this name is way too long for whatsapp", "participants": []string{"123"}}},
+		{"no participants", map[string]any{"name": "Test", "participants": []string{}}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, _ := json.Marshal(tc.body)
+			resp, err := http.Post(srv.URL+"/api/create_group", "application/json", bytes.NewReader(b))
+			if err != nil {
+				t.Fatalf("POST: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("expected 400, got %d", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestLeaveGroupValidationErrors400(t *testing.T) {
+	store := newTestStore(t)
+	srv := httptest.NewServer(buildRouter(nil, store))
+	defer srv.Close()
+
+	cases := []struct {
+		name string
+		body map[string]any
+	}{
+		{"empty jid", map[string]any{"jid": ""}},
+		{"non-group jid", map[string]any{"jid": "123456789@s.whatsapp.net"}},
+		{"invalid jid", map[string]any{"jid": "not-a-jid"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, _ := json.Marshal(tc.body)
+			resp, err := http.Post(srv.URL+"/api/leave_group", "application/json", bytes.NewReader(b))
+			if err != nil {
+				t.Fatalf("POST: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("expected 400, got %d", resp.StatusCode)
+			}
+		})
+	}
+}
+
 func TestSendHandlerAcceptsQuotedID(t *testing.T) {
 	srv := httptest.NewServer(buildRouter(nil, nil))
 	defer srv.Close()

@@ -252,6 +252,7 @@ type CreateGroupResponse struct {
 	JID              string `json:"jid,omitempty"`
 	Name             string `json:"name,omitempty"`
 	ParticipantCount int    `json:"participant_count,omitempty"`
+	clientError      bool   // true for input-validation failures → HTTP 400
 }
 
 // LeaveGroupRequest represents the request body for the leave group API.
@@ -261,8 +262,9 @@ type LeaveGroupRequest struct {
 
 // LeaveGroupResponse represents the response for the leave group API.
 type LeaveGroupResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	Success     bool   `json:"success"`
+	Message     string `json:"message"`
+	clientError bool   // true for input-validation failures → HTTP 400
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -1040,17 +1042,15 @@ func resolveBridgePort(envVal string, logger waLog.Logger) int {
 
 // createWhatsAppGroup creates a new group on WhatsApp.
 func createWhatsAppGroup(client *whatsmeow.Client, messageStore *MessageStore, req CreateGroupRequest) CreateGroupResponse {
-	if !client.IsConnected() {
-		return CreateGroupResponse{Success: false, Message: "Not connected to WhatsApp"}
-	}
+	// Validate inputs before touching the client so callers get 400 not 500.
 	if strings.TrimSpace(req.Name) == "" {
-		return CreateGroupResponse{Success: false, Message: "Group name is required"}
+		return CreateGroupResponse{Success: false, Message: "Group name is required", clientError: true}
 	}
 	if len([]rune(req.Name)) > 25 {
-		return CreateGroupResponse{Success: false, Message: "Group name must be 25 characters or fewer"}
+		return CreateGroupResponse{Success: false, Message: "Group name must be 25 characters or fewer", clientError: true}
 	}
 	if len(req.Participants) == 0 {
-		return CreateGroupResponse{Success: false, Message: "At least one participant is required"}
+		return CreateGroupResponse{Success: false, Message: "At least one participant is required", clientError: true}
 	}
 
 	participantJIDs := make([]types.JID, 0, len(req.Participants))
@@ -1064,7 +1064,7 @@ func createWhatsAppGroup(client *whatsmeow.Client, messageStore *MessageStore, r
 		if strings.Contains(p, "@") {
 			jid, err = types.ParseJID(p)
 			if err != nil {
-				return CreateGroupResponse{Success: false, Message: fmt.Sprintf("Invalid participant JID %q: %v", p, err)}
+				return CreateGroupResponse{Success: false, Message: fmt.Sprintf("Invalid participant JID %q: %v", p, err), clientError: true}
 			}
 		} else {
 			jid = types.JID{User: strings.TrimPrefix(p, "+"), Server: types.DefaultUserServer}
@@ -1072,7 +1072,7 @@ func createWhatsAppGroup(client *whatsmeow.Client, messageStore *MessageStore, r
 		participantJIDs = append(participantJIDs, jid)
 	}
 	if len(participantJIDs) == 0 {
-		return CreateGroupResponse{Success: false, Message: "No valid participants after parsing"}
+		return CreateGroupResponse{Success: false, Message: "No valid participants after parsing", clientError: true}
 	}
 
 	createReq := whatsmeow.ReqCreateGroup{
@@ -1085,9 +1085,13 @@ func createWhatsAppGroup(client *whatsmeow.Client, messageStore *MessageStore, r
 	if req.CommunityParentJID != "" {
 		parentJID, err := types.ParseJID(req.CommunityParentJID)
 		if err != nil {
-			return CreateGroupResponse{Success: false, Message: fmt.Sprintf("Invalid community_parent_jid: %v", err)}
+			return CreateGroupResponse{Success: false, Message: fmt.Sprintf("Invalid community_parent_jid: %v", err), clientError: true}
 		}
 		createReq.GroupLinkedParent.LinkedParentJID = parentJID
+	}
+
+	if !client.IsConnected() {
+		return CreateGroupResponse{Success: false, Message: "Not connected to WhatsApp"}
 	}
 
 	groupInfo, err := client.CreateGroup(context.Background(), createReq)
@@ -1114,19 +1118,20 @@ func createWhatsAppGroup(client *whatsmeow.Client, messageStore *MessageStore, r
 
 // leaveWhatsAppGroup leaves the specified group on WhatsApp.
 func leaveWhatsAppGroup(client *whatsmeow.Client, jidStr string) LeaveGroupResponse {
-	if !client.IsConnected() {
-		return LeaveGroupResponse{Success: false, Message: "Not connected to WhatsApp"}
-	}
+	// Validate inputs before touching the client so callers get 400 not 500.
 	jidStr = strings.TrimSpace(jidStr)
 	if jidStr == "" {
-		return LeaveGroupResponse{Success: false, Message: "Group JID is required"}
+		return LeaveGroupResponse{Success: false, Message: "Group JID is required", clientError: true}
 	}
 	jid, err := types.ParseJID(jidStr)
 	if err != nil {
-		return LeaveGroupResponse{Success: false, Message: fmt.Sprintf("Invalid JID: %v", err)}
+		return LeaveGroupResponse{Success: false, Message: fmt.Sprintf("Invalid JID: %v", err), clientError: true}
 	}
 	if jid.Server != "g.us" {
-		return LeaveGroupResponse{Success: false, Message: "Only group JIDs (@g.us) can be left"}
+		return LeaveGroupResponse{Success: false, Message: "Only group JIDs (@g.us) can be left", clientError: true}
+	}
+	if !client.IsConnected() {
+		return LeaveGroupResponse{Success: false, Message: "Not connected to WhatsApp"}
 	}
 	if err := client.LeaveGroup(context.Background(), jid); err != nil {
 		return LeaveGroupResponse{Success: false, Message: fmt.Sprintf("Error leaving group: %v", err)}
@@ -1249,7 +1254,11 @@ func buildRouter(client *whatsmeow.Client, messageStore *MessageStore) *http.Ser
 		resp := createWhatsAppGroup(client, messageStore, req)
 		w.Header().Set("Content-Type", "application/json")
 		if !resp.Success {
-			w.WriteHeader(http.StatusInternalServerError)
+			if resp.clientError {
+				w.WriteHeader(http.StatusBadRequest)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
 		}
 		json.NewEncoder(w).Encode(resp)
 	})
@@ -1269,7 +1278,11 @@ func buildRouter(client *whatsmeow.Client, messageStore *MessageStore) *http.Ser
 		resp := leaveWhatsAppGroup(client, req.JID)
 		w.Header().Set("Content-Type", "application/json")
 		if !resp.Success {
-			w.WriteHeader(http.StatusInternalServerError)
+			if resp.clientError {
+				w.WriteHeader(http.StatusBadRequest)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
 		}
 		json.NewEncoder(w).Encode(resp)
 	})
