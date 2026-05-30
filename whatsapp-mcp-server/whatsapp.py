@@ -107,7 +107,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {content_prefix}{message.content}\n"
+        output += f"From: {sender_name}: {content_prefix}{message.content} [id:{message.id}]\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
     return output
@@ -623,18 +623,20 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+def send_message(recipient: str, message: str, quoted_id: Optional[str] = None) -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
-        
+        if quoted_id:
+            payload["quoted_id"] = quoted_id
+
         response = requests.post(url, json=payload)
         
         # Check if the request was successful
