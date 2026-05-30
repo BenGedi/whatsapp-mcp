@@ -493,6 +493,24 @@ func TestSendMessageRequestQuotedIDJSON(t *testing.T) {
 // /api/send handler — quoted_id forwarded in request body
 // --------------------------------------------------------------------------
 
+// TestQuotedIDLookupMissingReturnsErrNoRows verifies that the DB query used in
+// sendWhatsAppMessage returns sql.ErrNoRows when the quoted_id is not in the store,
+// ensuring the "if err != nil { return false, ... }" guard triggers correctly.
+func TestQuotedIDLookupMissingReturnsErrNoRows(t *testing.T) {
+	store := newTestStore(t)
+	chatJID := "123456789@s.whatsapp.net"
+
+	var content, sender string
+	err := store.db.QueryRow(
+		"SELECT COALESCE(content, ''), COALESCE(sender, '') FROM messages WHERE id = ? AND chat_jid = ?",
+		"nonexistent-id", chatJID,
+	).Scan(&content, &sender)
+
+	if err != sql.ErrNoRows {
+		t.Errorf("expected sql.ErrNoRows for absent quoted_id, got %v", err)
+	}
+}
+
 func TestSendHandlerAcceptsQuotedID(t *testing.T) {
 	srv := httptest.NewServer(buildRouter(nil, nil))
 	defer srv.Close()
