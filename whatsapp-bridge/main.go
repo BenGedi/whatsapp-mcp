@@ -202,8 +202,8 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
-// validateMediaPath rejects relative paths and paths that contain traversal
-// sequences, preventing arbitrary file reads via the /api/send endpoint.
+// validateMediaPath rejects relative paths and paths outside the user's home
+// directory, preventing path traversal and system-file exfiltration via /api/send.
 func validateMediaPath(mediaPath string) error {
 	if mediaPath == "" {
 		return fmt.Errorf("media path cannot be empty")
@@ -212,6 +212,12 @@ func validateMediaPath(mediaPath string) error {
 		return fmt.Errorf("media path must be absolute")
 	}
 	cleaned := filepath.Clean(mediaPath)
+	homeDir, err := os.UserHomeDir()
+	if err == nil {
+		if !strings.HasPrefix(cleaned, homeDir+string(filepath.Separator)) {
+			return fmt.Errorf("media path must be within the user home directory")
+		}
+	}
 	info, err := os.Stat(cleaned)
 	if err != nil {
 		return fmt.Errorf("media file not found: %v", err)
@@ -421,7 +427,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	// Check for document message
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := filepath.Base(doc.GetFileName())
-		if filename == "" || filename == "." {
+		if filename == "" || filename == "." || filename == ".." {
 			filename = "document_" + time.Now().Format("20060102_150405")
 		}
 		return "document", filename,
@@ -580,7 +586,7 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 // replacing colons and rejecting any path-traversal characters.
 func sanitizeChatJIDForPath(chatJID string) (string, error) {
 	safe := strings.ReplaceAll(chatJID, ":", "_")
-	if strings.Contains(safe, "..") || strings.ContainsAny(safe, "/\\") {
+	if safe == ".." || strings.ContainsAny(safe, "/\\") {
 		return "", fmt.Errorf("invalid chat JID: %q", chatJID)
 	}
 	return safe, nil
