@@ -9,6 +9,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "").strip() or "http://localhost:8080/api"
 
 @dataclass
@@ -400,44 +401,49 @@ def list_chats(
 
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
+    search_pattern = f"%{query}%"
+    seen_jids: set = set()
+    result: List[Contact] = []
+
+    # Primary: chats already known to messages.db
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
-        cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
-        return result
-        
-    except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
-    finally:
-        if 'conn' in locals():
-            conn.close()
+        cursor.execute(
+            """SELECT DISTINCT jid, name FROM chats
+               WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+                 AND jid NOT LIKE '%@g.us'
+               ORDER BY name, jid LIMIT 50""",
+            (search_pattern, search_pattern),
+        )
+        for jid, name in cursor.fetchall():
+            seen_jids.add(jid)
+            result.append(Contact(phone_number=jid.split("@")[0], name=name, jid=jid))
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+    # Fallback: whatsmeow full contact store (covers contacts not yet in chat history)
+    try:
+        conn2 = sqlite3.connect(WHATSAPP_DB_PATH)
+        cursor2 = conn2.cursor()
+        cursor2.execute(
+            """SELECT their_jid, COALESCE(full_name, push_name) as name
+               FROM whatsmeow_contacts
+               WHERE (LOWER(full_name) LIKE LOWER(?) OR LOWER(push_name) LIKE LOWER(?))
+                 AND their_jid LIKE '%@s.whatsapp.net'
+               ORDER BY name LIMIT 50""",
+            (search_pattern, search_pattern),
+        )
+        for jid, name in cursor2.fetchall():
+            if jid not in seen_jids:
+                seen_jids.add(jid)
+                result.append(Contact(phone_number=jid.split("@")[0], name=name, jid=jid))
+        conn2.close()
+    except sqlite3.Error:
+        pass
+
+    return result
 
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
@@ -891,6 +897,23 @@ def resolve_chat_jid(name_or_jid: str) -> Tuple[Optional[str], str]:
         conn.close()
     except sqlite3.Error as e:
         return None, f"Database error: {e}"
+
+    if not rows:
+        # Fall back to whatsmeow's full contact store (covers contacts not yet in chat history)
+        try:
+            conn2 = sqlite3.connect(WHATSAPP_DB_PATH)
+            cursor2 = conn2.cursor()
+            cursor2.execute(
+                """SELECT their_jid, COALESCE(full_name, push_name) as name
+                   FROM whatsmeow_contacts
+                   WHERE (LOWER(full_name) LIKE LOWER(?) OR LOWER(push_name) LIKE LOWER(?))
+                     AND their_jid LIKE '%@s.whatsapp.net'""",
+                (f"%{term}%", f"%{term}%"),
+            )
+            rows = cursor2.fetchall()
+            conn2.close()
+        except sqlite3.Error:
+            rows = []
 
     if not rows:
         return None, f"No chat found matching '{term}' — run list_chats to see available chats"

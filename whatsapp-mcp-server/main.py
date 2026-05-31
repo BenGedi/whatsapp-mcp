@@ -1,3 +1,10 @@
+import os
+import sys
+import socket
+import subprocess
+import threading
+import time
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -19,6 +26,58 @@ from whatsapp import (
     subscribe_chat as whatsapp_subscribe_chat,
     unsubscribe_chat as whatsapp_unsubscribe_chat
 )
+
+def _bridge_reachable() -> bool:
+    try:
+        with socket.create_connection(("localhost", 8080), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_bridge_running() -> None:
+    if _bridge_reachable():
+        return
+
+    bridge_dir = Path(__file__).parent.parent / "whatsapp-bridge"
+    exe_name = "whatsapp-client.exe" if sys.platform == "win32" else "whatsapp-client"
+    exe_path = bridge_dir / exe_name
+
+    if not exe_path.exists():
+        print(
+            f"[whatsapp-mcp] Bridge executable not found at {exe_path}. "
+            "Please build the bridge first: cd whatsapp-bridge && go build -o whatsapp-client",
+            file=sys.stderr,
+        )
+        return
+
+    print(f"[whatsapp-mcp] Starting bridge: {exe_path}", file=sys.stderr)
+    subprocess.Popen(
+        [str(exe_path)],
+        cwd=str(bridge_dir),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Wait up to 15 s for the bridge to accept connections
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if _bridge_reachable():
+            print("[whatsapp-mcp] Bridge is ready.", file=sys.stderr)
+            return
+        time.sleep(0.5)
+
+    print("[whatsapp-mcp] Warning: bridge did not become ready in 15 s.", file=sys.stderr)
+
+
+def _bridge_watchdog() -> None:
+    """Background thread: restart the bridge if it stops responding."""
+    while True:
+        time.sleep(10)
+        if not _bridge_reachable():
+            print("[whatsapp-mcp] Bridge unreachable — restarting...", file=sys.stderr)
+            ensure_bridge_running()
+
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
@@ -83,7 +142,17 @@ def list_chats(
     sort_by: str = "last_active"
 ) -> List[Dict[str, Any]]:
     """Get WhatsApp chats matching specified criteria.
-    
+
+    IMPORTANT — first-run onboarding:
+    After calling this tool, check the 'watched' field on the returned chats.
+    If NO chats have watched=true, the user has not subscribed to any chats yet,
+    which means NO messages are being stored. In that case you MUST:
+    1. Show the user the list of available chats (name + JID).
+    2. Ask which chats they want to subscribe to (by name is fine).
+    3. Call subscribe_chat for each one they choose before proceeding.
+    Do not silently continue — without at least one subscription, all message
+    queries will return empty results.
+
     Args:
         query: Optional search term to filter chats by name or JID
         limit: Maximum number of chats to return (default 20)
@@ -319,7 +388,7 @@ def remove_participant(group_jid: str, participant: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def subscribe_chat(chat: str, backfill: bool = False) -> Dict[str, Any]:
+def subscribe_chat(chat: str, backfill: bool = True) -> Dict[str, Any]:
     """Start storing messages from a WhatsApp chat or group.
 
     Call list_chats first to see available chats (all chats appear there even
@@ -329,8 +398,8 @@ def subscribe_chat(chat: str, backfill: bool = False) -> Dict[str, Any]:
         chat: Chat name (e.g. "Work Team"), phone number (e.g. "972501234567"),
               or JID (e.g. "120363426272007458@g.us"). Name is matched
               case-insensitively (Hebrew and English both supported).
-        backfill: Ignored for now — delete messages.db and restart the bridge
-                  to trigger a fresh history sync for all subscribed chats.
+        backfill: If True (default), request full message history from WhatsApp
+                  for this chat. History arrives within a few seconds via sync.
 
     Returns:
         Dict with success (bool) and message (str).
@@ -357,5 +426,7 @@ def unsubscribe_chat(chat: str) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # Initialize and run the server
+    ensure_bridge_running()
+    t = threading.Thread(target=_bridge_watchdog, daemon=True)
+    t.start()
     mcp.run(transport='stdio')

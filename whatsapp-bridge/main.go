@@ -1308,9 +1308,8 @@ func subscribeWhatsAppChat(client *whatsmeow.Client, store *MessageStore, jidRaw
 	}
 	msg := fmt.Sprintf("Subscribed to %s", jid)
 	if backfill {
-		// Note: programmatic history backfill is not yet supported.
-		// Delete messages.db and restart the bridge to trigger a fresh history sync.
-		msg += " (backfill not yet supported — restart the bridge with a fresh messages.db)"
+		go requestHistorySync(client)
+		msg += " — requesting message history from WhatsApp (may take a few seconds)"
 	}
 	return SubscribeChatResponse{Success: true, Message: msg}
 }
