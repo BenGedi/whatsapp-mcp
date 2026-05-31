@@ -38,7 +38,8 @@ func newTestStore(t *testing.T) *MessageStore {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			watched BOOLEAN DEFAULT 0
 		);
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,

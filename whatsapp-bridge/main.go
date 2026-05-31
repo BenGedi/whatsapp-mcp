@@ -91,6 +91,23 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Migrate: add watched column if it doesn't exist (safe to run every startup).
+	if rows, qErr := db.Query("PRAGMA table_info(chats)"); qErr == nil {
+		hasWatched := false
+		for rows.Next() {
+			var cid, notnull, pk int
+			var colName, colType string
+			var dflt sql.NullString
+			if rows.Scan(&cid, &colName, &colType, &notnull, &dflt, &pk) == nil && colName == "watched" {
+				hasWatched = true
+			}
+		}
+		rows.Close()
+		if !hasWatched {
+			db.Exec("ALTER TABLE chats ADD COLUMN watched BOOLEAN DEFAULT 0")
+		}
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -99,10 +116,11 @@ func (store *MessageStore) Close() error {
 	return store.db.Close()
 }
 
-// Store a chat in the database
+// Store a chat in the database. Uses upsert so the watched flag is never overwritten.
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time, watched) VALUES (?, ?, ?, 0)
+		 ON CONFLICT(jid) DO UPDATE SET name=excluded.name, last_message_time=excluded.last_message_time`,
 		jid, name, lastMessageTime,
 	)
 	return err
@@ -126,6 +144,30 @@ func (store *MessageStore) EnsureChat(jid string, lastMessageTime time.Time) err
 		"INSERT OR IGNORE INTO chats (jid, name, last_message_time) VALUES (?, '', ?)",
 		jid, lastMessageTime,
 	)
+	return err
+}
+
+// IsChatWatched reports whether the given chat JID is subscribed for message storage.
+// Returns false on any error (safe default: skip storage).
+func (store *MessageStore) IsChatWatched(jid string) bool {
+	var watched bool
+	err := store.db.QueryRow("SELECT COALESCE(watched, 0) FROM chats WHERE jid = ?", jid).Scan(&watched)
+	if err != nil {
+		return false
+	}
+	return watched
+}
+
+// SetChatWatched sets the watched flag for a chat, creating the chat row if it doesn't exist yet.
+func (store *MessageStore) SetChatWatched(jid string, watched bool) error {
+	_, err := store.db.Exec(
+		"INSERT OR IGNORE INTO chats (jid, name, last_message_time, watched) VALUES (?, '', ?, 0)",
+		jid, time.Now(),
+	)
+	if err != nil {
+		return err
+	}
+	_, err = store.db.Exec("UPDATE chats SET watched = ? WHERE jid = ?", watched, jid)
 	return err
 }
 
@@ -278,6 +320,24 @@ type RemoveParticipantResponse struct {
 	Success     bool   `json:"success"`
 	Message     string `json:"message"`
 	clientError bool
+}
+
+// SubscribeChatRequest is the request body for /api/subscribe_chat.
+type SubscribeChatRequest struct {
+	JID      string `json:"jid"`
+	Backfill bool   `json:"backfill"`
+}
+
+// SubscribeChatResponse is the response body for /api/subscribe_chat and /api/unsubscribe_chat.
+type SubscribeChatResponse struct {
+	Success     bool   `json:"success"`
+	Message     string `json:"message"`
+	clientError bool
+}
+
+// UnsubscribeChatRequest is the request body for /api/unsubscribe_chat.
+type UnsubscribeChatRequest struct {
+	JID string `json:"jid"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -774,6 +834,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
+	// Skip message storage for unwatched chats; chat metadata row is kept for discovery.
+	if !messageStore.IsChatWatched(chatJID) {
+		return
+	}
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
@@ -1211,6 +1276,57 @@ func removeWhatsAppGroupParticipant(client groupParticipantClient, groupJIDStr, 
 	return RemoveParticipantResponse{Success: true, Message: fmt.Sprintf("Removed %s from %s", resolvedJID.String(), groupJID.String())}
 }
 
+// normalizeSubscribeJID converts a bare phone number or any JID string into the
+// canonical form used by handleMessage (e.g. "972501234567" → "972501234567@s.whatsapp.net").
+// LID JIDs are resolved to their PN equivalents when a connected client is available.
+func normalizeSubscribeJID(client *whatsmeow.Client, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("JID is required")
+	}
+	// If no '@', treat as a bare phone number and append the default PN server.
+	if !strings.Contains(raw, "@") {
+		raw = raw + "@" + types.DefaultUserServer
+	}
+	parsed, err := types.ParseJID(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid JID %q: %w", raw, err)
+	}
+	// Resolve LID → PN so the stored key matches what handleMessage writes.
+	resolved := resolveToPN(client, parsed)
+	return resolved.String(), nil
+}
+
+// subscribeWhatsAppChat marks a chat as watched.
+func subscribeWhatsAppChat(client *whatsmeow.Client, store *MessageStore, jidRaw string, backfill bool) SubscribeChatResponse {
+	jid, err := normalizeSubscribeJID(client, jidRaw)
+	if err != nil {
+		return SubscribeChatResponse{Success: false, Message: err.Error(), clientError: true}
+	}
+	if err := store.SetChatWatched(jid, true); err != nil {
+		return SubscribeChatResponse{Success: false, Message: fmt.Sprintf("Failed to subscribe: %v", err)}
+	}
+	msg := fmt.Sprintf("Subscribed to %s", jid)
+	if backfill {
+		// Note: programmatic history backfill is not yet supported.
+		// Delete messages.db and restart the bridge to trigger a fresh history sync.
+		msg += " (backfill not yet supported — restart the bridge with a fresh messages.db)"
+	}
+	return SubscribeChatResponse{Success: true, Message: msg}
+}
+
+// unsubscribeWhatsAppChat clears the watched flag for a chat.
+func unsubscribeWhatsAppChat(client *whatsmeow.Client, store *MessageStore, jidRaw string) SubscribeChatResponse {
+	jid, err := normalizeSubscribeJID(client, jidRaw)
+	if err != nil {
+		return SubscribeChatResponse{Success: false, Message: err.Error(), clientError: true}
+	}
+	if err := store.SetChatWatched(jid, false); err != nil {
+		return SubscribeChatResponse{Success: false, Message: fmt.Sprintf("Failed to unsubscribe: %v", err)}
+	}
+	return SubscribeChatResponse{Success: true, Message: fmt.Sprintf("Unsubscribed from %s", jid)}
+}
+
 func buildRouter(client *whatsmeow.Client, messageStore *MessageStore) *http.ServeMux {
 	mux := http.NewServeMux()
 
@@ -1372,6 +1488,54 @@ func buildRouter(client *whatsmeow.Client, messageStore *MessageStore) *http.Ser
 		}
 		fmt.Printf("Received request to leave group %s\n", req.JID)
 		resp := leaveWhatsAppGroup(client, req.JID)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			if resp.clientError {
+				w.WriteHeader(http.StatusBadRequest)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for subscribing to a chat (start storing messages)
+	mux.HandleFunc("/api/subscribe_chat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req SubscribeChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to subscribe to chat %s (backfill=%v)\n", req.JID, req.Backfill)
+		resp := subscribeWhatsAppChat(client, messageStore, req.JID, req.Backfill)
+		w.Header().Set("Content-Type", "application/json")
+		if !resp.Success {
+			if resp.clientError {
+				w.WriteHeader(http.StatusBadRequest)
+			} else {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for unsubscribing from a chat (stop storing new messages)
+	mux.HandleFunc("/api/unsubscribe_chat", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req UnsubscribeChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		fmt.Printf("Received request to unsubscribe from chat %s\n", req.JID)
+		resp := unsubscribeWhatsAppChat(client, messageStore, req.JID)
 		w.Header().Set("Content-Type", "application/json")
 		if !resp.Success {
 			if resp.clientError {
@@ -1663,6 +1827,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			}
 
 			messageStore.StoreChat(chatJID, name, timestamp)
+
+			// Only store messages for subscribed chats; the chat row itself is kept for discovery.
+			if !messageStore.IsChatWatched(chatJID) {
+				continue
+			}
 
 			// Store messages
 			for _, msg := range messages {

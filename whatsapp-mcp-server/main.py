@@ -15,7 +15,9 @@ from whatsapp import (
     download_media as whatsapp_download_media,
     create_group as whatsapp_create_group,
     leave_group as whatsapp_leave_group,
-    remove_participant as whatsapp_remove_participant
+    remove_participant as whatsapp_remove_participant,
+    subscribe_chat as whatsapp_subscribe_chat,
+    unsubscribe_chat as whatsapp_unsubscribe_chat
 )
 
 # Initialize FastMCP server
@@ -313,6 +315,44 @@ def remove_participant(group_jid: str, participant: str) -> Dict[str, Any]:
         Dict with success (bool) and message (str).
     """
     success, message = whatsapp_remove_participant(group_jid, participant)
+    return {"success": success, "message": message}
+
+
+@mcp.tool()
+def subscribe_chat(chat: str, backfill: bool = False) -> Dict[str, Any]:
+    """Start storing messages from a WhatsApp chat or group.
+
+    Call list_chats first to see available chats (all chats appear there even
+    before subscribing — subscribing is what causes their messages to be saved).
+
+    Args:
+        chat: Chat name (e.g. "Work Team"), phone number (e.g. "972501234567"),
+              or JID (e.g. "120363426272007458@g.us"). Name is matched
+              case-insensitively (Hebrew and English both supported).
+        backfill: Ignored for now — delete messages.db and restart the bridge
+                  to trigger a fresh history sync for all subscribed chats.
+
+    Returns:
+        Dict with success (bool) and message (str).
+    """
+    success, message = whatsapp_subscribe_chat(chat, backfill)
+    return {"success": success, "message": message}
+
+
+@mcp.tool()
+def unsubscribe_chat(chat: str) -> Dict[str, Any]:
+    """Stop storing new messages from a WhatsApp chat or group.
+
+    Existing stored messages are kept. Future messages will not be saved until
+    you subscribe again.
+
+    Args:
+        chat: Chat name, phone number, or JID (same resolution as subscribe_chat).
+
+    Returns:
+        Dict with success (bool) and message (str).
+    """
+    success, message = whatsapp_unsubscribe_chat(chat)
     return {"success": success, "message": message}
 
 

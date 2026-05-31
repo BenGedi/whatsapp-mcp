@@ -30,6 +30,7 @@ class Chat:
     last_message: Optional[str] = None
     last_sender: Optional[str] = None
     last_is_from_me: Optional[bool] = None
+    watched: bool = False
 
     @property
     def is_group(self) -> bool:
@@ -331,13 +332,14 @@ def list_chats(
         
         # Build base query
         query_parts = ["""
-            SELECT 
+            SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
                 messages.content as last_message,
                 messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                messages.is_from_me as last_is_from_me,
+                COALESCE(chats.watched, 0) as watched
             FROM chats
         """]
         
@@ -381,12 +383,13 @@ def list_chats(
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_is_from_me=chat_data[5],
+                watched=bool(chat_data[6]),
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -842,6 +845,90 @@ def remove_participant(group_jid: str, participant: str) -> Tuple[bool, str]:
             return False, "participant is required"
         url = f"{WHATSAPP_API_BASE_URL}/remove_participant"
         response = requests.post(url, json={"group_jid": group_jid, "participant": participant})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}"
+        return bool(result.get("success", False)), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def resolve_chat_jid(name_or_jid: str) -> Tuple[Optional[str], str]:
+    """Resolve a chat name, phone number, or JID to a canonical JID.
+
+    Returns (jid, error_msg). On success error_msg is ""; on failure jid is None.
+    """
+    term = name_or_jid.strip()
+    if not term:
+        return None, "chat name or JID is required"
+
+    # Already contains '@' — treat as a JID directly.
+    if "@" in term:
+        return term, ""
+
+    # All digits (possibly with leading '+') — bare phone number.
+    digits = term.lstrip("+")
+    if digits.isdigit():
+        return f"{digits}@s.whatsapp.net", ""
+
+    # Looks like a formatted phone number (digits, spaces, dashes, parens).
+    stripped = "".join(c for c in term if c.isdigit())
+    if stripped and all(c in "0123456789 ()-+" for c in term):
+        return f"{stripped}@s.whatsapp.net", ""
+
+    # Fall back to name search in the chats table.
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT jid, name FROM chats WHERE LOWER(name) LIKE LOWER(?)",
+            (f"%{term}%",),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+    except sqlite3.Error as e:
+        return None, f"Database error: {e}"
+
+    if not rows:
+        return None, f"No chat found matching '{term}' — run list_chats to see available chats"
+    if len(rows) > 1:
+        names = ", ".join(f"'{r[1]}'" for r in rows)
+        return None, f"Multiple chats match '{term}': {names} — be more specific"
+    return rows[0][0], ""
+
+
+def subscribe_chat(name_or_jid: str, backfill: bool = False) -> Tuple[bool, str]:
+    """Start storing messages for a chat identified by name, phone number, or JID."""
+    name_or_jid = name_or_jid.strip()
+    jid, err = resolve_chat_jid(name_or_jid)
+    if err:
+        return False, err
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/subscribe_chat"
+        response = requests.post(url, json={"jid": jid, "backfill": backfill})
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return False, f"Error parsing response: {response.text}"
+        return bool(result.get("success", False)), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def unsubscribe_chat(name_or_jid: str) -> Tuple[bool, str]:
+    """Stop storing new messages for a chat identified by name, phone number, or JID."""
+    name_or_jid = name_or_jid.strip()
+    jid, err = resolve_chat_jid(name_or_jid)
+    if err:
+        return False, err
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/unsubscribe_chat"
+        response = requests.post(url, json={"jid": jid})
         try:
             result = response.json()
         except json.JSONDecodeError:
