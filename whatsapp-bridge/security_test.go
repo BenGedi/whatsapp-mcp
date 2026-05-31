@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -63,8 +64,13 @@ func TestValidateMediaPath(t *testing.T) {
 			errContains: "media path must be absolute",
 		},
 		{
-			name:        "system file outside home directory",
-			path:        "/etc/passwd",
+			name: "system file outside home directory",
+			path: func() string {
+				if runtime.GOOS == "windows" {
+					return filepath.Join(os.Getenv("SYSTEMROOT"), "System32", "cmd.exe")
+				}
+				return "/etc/passwd"
+			}(),
 			wantError:   true,
 			errContains: "media path must be within the user home directory",
 		},

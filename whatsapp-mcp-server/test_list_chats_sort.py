@@ -13,7 +13,8 @@ def _make_db(path: str) -> None:
         CREATE TABLE chats (
             jid TEXT PRIMARY KEY,
             name TEXT,
-            last_message_time TEXT
+            last_message_time TEXT,
+            watched BOOLEAN DEFAULT 0
         );
         CREATE TABLE messages (
             id TEXT PRIMARY KEY,
@@ -23,8 +24,8 @@ def _make_db(path: str) -> None:
             sender TEXT,
             is_from_me INTEGER
         );
-        INSERT INTO chats VALUES ('alpha@s.whatsapp.net', 'Alpha', '2026-05-01T10:00:00');
-        INSERT INTO chats VALUES ('beta@s.whatsapp.net',  'Beta',  '2026-05-02T10:00:00');
+        INSERT INTO chats VALUES ('alpha@s.whatsapp.net', 'Alpha', '2026-05-01T10:00:00', 0);
+        INSERT INTO chats VALUES ('beta@s.whatsapp.net',  'Beta',  '2026-05-02T10:00:00', 0);
     """)
     conn.commit()
     conn.close()
